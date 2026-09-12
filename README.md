@@ -162,7 +162,7 @@ pio device monitor
 
 ## Touch Controls
 
-The screen is divided into three vertical zones: **left 45%**, **center 10%**, **right 45%**. The narrow center zone prevents accidental view changes. Tap for a short press, or hold for 1 second for a long press.
+The screen is divided into three vertical zones: **left 37.5%** (0-119), **center 25%** (120-199), **right 37.5%** (200-319). A tap is resolved to the median position of the press, so a stray reading as you lift off cannot trigger the wrong zone. Tap for a short press, or hold for 1 second for a long press.
 
 | View | Left tap | Center tap | Center HOLD (1s) | Right tap |
 |------|----------|------------|------------------|-----------|

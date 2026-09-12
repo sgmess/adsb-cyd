@@ -249,6 +249,12 @@ static uint32_t hash_icao(const char *hex) {
 
 // ---- Touch ----
 
+// Touch zones: 37.5% left, 25% center, 37.5% right. The center band needs to
+// be a usable stylus target — at 10% (32px) centre-aimed taps measured on this
+// panel landed on the boundary and fired the left action instead.
+#define TOUCH_LEFT_MAX  (LCD_H_RES * 3 / 8)  // 120
+#define TOUCH_RIGHT_MIN (LCD_H_RES * 5 / 8)  // 200
+
 static uint16_t touchRead16(uint8_t cmd) {
     digitalWrite(XPT2046_CS, LOW);
     touchSPI.beginTransaction(SPISettings(2500000, MSBFIRST, SPI_MODE0));
@@ -259,17 +265,73 @@ static uint16_t touchRead16(uint8_t cmd) {
     return val >> 3;
 }
 
+// The touch panel is rotated 90 degrees relative to the display in rotation 1:
+// the XPT2046 Y channel (0x90) varies across the screen and the X channel
+// (0xD0) varies down it, so the raw axes are crossed when mapping to pixels.
+// Median of 5 rather than a mean: a single spurious sample from a resistive
+// panel would drag an average far enough to fire the wrong touch zone.
+static uint16_t medianOf5(uint8_t cmd) {
+    uint16_t v[5];
+    for (int i = 0; i < 5; i++) v[i] = touchRead16(cmd);
+    for (int i = 1; i < 5; i++) {
+        uint16_t k = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; j--; }
+        v[j + 1] = k;
+    }
+    return v[2];
+}
+
+// A tap is decided by the median of the samples taken during the press, not
+// by the last one: a resistive panel reports stray coordinates as pressure
+// builds and releases, and acting on the final sample fires the wrong zone.
+#define TAP_SAMPLES 16
+static int tap_x[TAP_SAMPLES], tap_y[TAP_SAMPLES];
+static int tap_count = 0, tap_write = 0;
+
+static void tap_begin() {
+    tap_count = 0;
+    tap_write = 0;
+}
+
+static void tap_add(int x, int y) {
+    tap_x[tap_write] = x;
+    tap_y[tap_write] = y;
+    tap_write = (tap_write + 1) % TAP_SAMPLES;
+    if (tap_count < TAP_SAMPLES) tap_count++;
+}
+
+static bool tap_position(int &x, int &y) {
+    if (tap_count < 3) return false;  // a brush or a single spurious read
+    int xs[TAP_SAMPLES], ys[TAP_SAMPLES];
+    memcpy(xs, tap_x, tap_count * sizeof(int));
+    memcpy(ys, tap_y, tap_count * sizeof(int));
+    for (int i = 1; i < tap_count; i++) {
+        int a = xs[i], b = ys[i], j = i - 1;
+        while (j >= 0 && xs[j] > a) { xs[j + 1] = xs[j]; j--; }
+        xs[j + 1] = a;
+        j = i - 1;
+        while (j >= 0 && ys[j] > b) { ys[j + 1] = ys[j]; j--; }
+        ys[j + 1] = b;
+    }
+    x = xs[tap_count / 2];
+    y = ys[tap_count / 2];
+    return true;
+}
+
 static bool getTouchPoint(int &tx, int &ty) {
     if (digitalRead(XPT2046_IRQ) != LOW) return false;
-    uint32_t sumX = 0, sumY = 0;
-    for (int i = 0; i < 4; i++) {
-        sumX += touchRead16(0xD0);
-        sumY += touchRead16(0x90);
-    }
-    tx = map(sumX / 4, TOUCH_X_MIN, TOUCH_X_MAX, 0, 319);
-    ty = map(sumY / 4, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, 239);
+    uint16_t rawDown   = medianOf5(0xD0);  // panel X channel -> screen Y
+    uint16_t rawAcross = medianOf5(0x90);  // panel Y channel -> screen X
+    tx = map(rawAcross, TOUCH_X_MIN, TOUCH_X_MAX, 0, 319);
+    ty = map(rawDown,   TOUCH_Y_MIN, TOUCH_Y_MAX, 0, 239);
     tx = constrain(tx, 0, 319);
     ty = constrain(ty, 0, 239);
+#ifdef TOUCH_DEBUG
+    Serial.printf("touch raw=(%4u,%4u) -> screen=(%3d,%3d) zone=%s\n",
+                  rawDown, rawAcross, tx, ty,
+                  tx < TOUCH_LEFT_MAX ? "LEFT" : (tx > TOUCH_RIGHT_MIN ? "RIGHT" : "CENTER"));
+#endif
     return true;
 }
 
@@ -324,10 +386,6 @@ static int arrivals_row_count = 0;
 static int arrivals_list_y = 0;
 
 // ---- Touch handlers per view ----
-
-// Touch zones: 45% left, 10% center, 45% right
-#define TOUCH_LEFT_MAX  (LCD_H_RES * 9 / 20)  // 144
-#define TOUCH_RIGHT_MIN (LCD_H_RES * 11 / 20) // 176
 
 static void handle_touch_radar(int tx) {
     if (tx < TOUCH_LEFT_MAX) {
@@ -1463,25 +1521,28 @@ void loop() {
             touch_was_down = true;
             touch_down_time = now;
             long_press_fired = false;
-            saved_tx = tx;
-            saved_ty = ty;
+            tap_begin();
             last_touch_time = now;
             last_cycle_time = now;
-        } else {
-            saved_tx = tx;  // track latest position
-            saved_ty = ty;
-            if (!long_press_fired && (now - touch_down_time) >= LONG_PRESS_MS) {
-                long_press_fired = true;
-                if (saved_tx >= TOUCH_LEFT_MAX && saved_tx <= TOUCH_RIGHT_MIN) {
-                    if (current_view == VIEW_STATS)
-                        toggle_night_mode();
-                    else if (current_view == VIEW_SETTINGS)
-                        settings_adjust_selected();
-                }
+        }
+        tap_add(tx, ty);
+        if (!long_press_fired && (now - touch_down_time) >= LONG_PRESS_MS &&
+            tap_position(saved_tx, saved_ty)) {
+            long_press_fired = true;
+            if (saved_tx >= TOUCH_LEFT_MAX && saved_tx <= TOUCH_RIGHT_MIN) {
+                if (current_view == VIEW_STATS)
+                    toggle_night_mode();
+                else if (current_view == VIEW_SETTINGS)
+                    settings_adjust_selected();
             }
         }
     } else {
-        if (touch_was_down && !long_press_fired) {
+        if (touch_was_down && !long_press_fired && tap_position(saved_tx, saved_ty)) {
+#ifdef TOUCH_DEBUG
+            Serial.printf("TAP -> screen=(%3d,%3d) zone=%s\n", saved_tx, saved_ty,
+                          saved_tx < TOUCH_LEFT_MAX ? "LEFT"
+                              : (saved_tx > TOUCH_RIGHT_MIN ? "RIGHT" : "CENTER"));
+#endif
             switch (current_view) {
                 case VIEW_RADAR:    handle_touch_radar(saved_tx); break;
                 case VIEW_ARRIVALS: handle_touch_arrivals(saved_tx, saved_ty); break;
