@@ -123,7 +123,9 @@ static void apply_parsed(Aircraft &a, const ParsedEntry &p, bool is_new) {
 }
 
 static void parse_aircraft_json(JsonDocument &doc) {
-    JsonArray ac = doc["ac"].as<JsonArray>();
+    // adsb.fi names the array "aircraft"; adsbexchange-style feeds use "ac"
+    JsonArray ac = doc["aircraft"].as<JsonArray>();
+    if (ac.isNull()) ac = doc["ac"].as<JsonArray>();
     Serial.printf("parse: ac array size=%d\n", ac.size());
 
     static ParsedEntry parsed[MAX_AIRCRAFT];
@@ -213,6 +215,58 @@ static void update_ip_addr() {
         strlcpy(_fstats.ip_addr, "N/A", sizeof(_fstats.ip_addr));
 }
 
+// Pass-through wrapper around the HTTP body stream that counts bytes read,
+// so ArduinoJson can parse straight off the socket (no intermediate buffer —
+// a 64KB one does not reliably fit in the CYD's fragmented heap) while the
+// stats page still gets a byte total.
+class CountingStream : public Stream {
+public:
+    explicit CountingStream(Stream &src) : _src(src) {}
+    int available() override { return _src.available(); }
+    int peek() override { return _src.peek(); }
+    int read() override {
+        int c = _src.read();
+        if (c >= 0) _count++;
+        return c;
+    }
+    size_t readBytes(char *buffer, size_t length) override {
+        size_t n = _src.readBytes(buffer, length);
+        _count += n;
+        return n;
+    }
+    size_t write(uint8_t) override { return 0; }
+    void flush() override {}
+    size_t count() const { return _count; }
+private:
+    Stream &_src;
+    size_t _count = 0;
+};
+
+// Fields we keep from each aircraft entry — used as an ArduinoJson filter so
+// the rest of the (large) feed response is discarded during parsing.
+static void add_aircraft_filter(JsonObject af) {
+    af["hex"] = true;
+    af["flight"] = true;
+    af["r"] = true;
+    af["t"] = true;
+    af["category"] = true;
+    af["desc"] = true;
+    af["ownOp"] = true;
+    af["lat"] = true;
+    af["lon"] = true;
+    af["alt_baro"] = true;
+    af["gs"] = true;
+    af["track"] = true;
+    af["baro_rate"] = true;
+    af["squawk"] = true;
+    af["mach"] = true;
+    af["ias"] = true;
+    af["tas"] = true;
+    af["nav_altitude_mcp"] = true;
+    af["roll"] = true;
+    af["nav_qnh"] = true;
+}
+
 static void fetch_task(void *param) {
     // Wait for WiFi with retry and radio recycle
     Serial.print("Fetcher: waiting for WiFi");
@@ -235,11 +289,11 @@ static void fetch_task(void *param) {
     Serial.printf("\nWiFi connected, IP: %s\n", _fstats.ip_addr);
 
     char url[128];
-    snprintf(url, sizeof(url), "https://api.adsb.lol/v2/point/%.4f/%.4f/%d",
-             HOME_LAT, HOME_LON, ADSB_RADIUS_NM);
+    snprintf(url, sizeof(url), ADSB_API_URL_FMT, HOME_LAT, HOME_LON, ADSB_RADIUS_NM);
     Serial.printf("ADS-B API URL: %s\n", url);
 
     while (true) {
+        uint32_t backoff_ms = 0;
         if (network_connected()) {
             if (http_mutex_acquire(pdMS_TO_TICKS(15000))) {
                 WiFiClientSecure client;
@@ -248,6 +302,10 @@ static void fetch_task(void *param) {
 
                 HTTPClient http;
                 http.begin(client, url);
+                http.setUserAgent(HTTP_USER_AGENT);
+                // HTTP/1.0 => no chunked transfer-encoding, so the raw stream
+                // is the body itself and ArduinoJson can read it directly.
+                http.useHTTP10(true);
                 http.setTimeout(10000);
                 uint32_t t0 = millis();
                 int httpCode = http.GET();
@@ -258,60 +316,19 @@ static void fetch_task(void *param) {
                 if (httpCode == HTTP_CODE_OK) {
                     _fstats.last_fetch_ms = millis() - t0;
 
-                    // Read full response with deadline loop (fixes truncated JSON)
-                    int content_len = http.getSize();
-                    size_t buf_size = (content_len > 0) ? (size_t)content_len + 1 : 64 * 1024;
-                    char *buf = (char *)malloc(buf_size);
-                    size_t total = 0;
-
-                    if (buf) {
-                        size_t target = (content_len > 0) ? (size_t)content_len : buf_size - 1;
-                        WiFiClient *stream = http.getStreamPtr();
-                        uint32_t deadline = millis() + 15000;
-                        while (total < target && millis() < deadline) {
-                            int avail = stream->available();
-                            if (avail > 0) {
-                                int to_read = min((size_t)avail, target - total);
-                                total += stream->readBytes(buf + total, to_read);
-                            } else if (!stream->connected()) {
-                                break;
-                            } else {
-                                vTaskDelay(1);
-                            }
-                        }
-                        buf[total] = '\0';
-                    }
-                    _fstats.bytes_received += total;
-
-                    // Parse with filter — only extract fields we need
+                    // Parse straight off the socket with a filter — only the
+                    // fields we need are kept, the rest of the (large) body is
+                    // skipped without ever being buffered.
+                    // adsb.fi returns "aircraft"; adsbexchange-style feeds "ac".
                     JsonDocument filter;
-                    JsonObject af = filter["ac"][0].to<JsonObject>();
-                    af["hex"] = true;
-                    af["flight"] = true;
-                    af["r"] = true;
-                    af["t"] = true;
-                    af["category"] = true;
-                    af["desc"] = true;
-                    af["ownOp"] = true;
-                    af["lat"] = true;
-                    af["lon"] = true;
-                    af["alt_baro"] = true;
-                    af["gs"] = true;
-                    af["track"] = true;
-                    af["baro_rate"] = true;
-                    af["squawk"] = true;
-                    af["mach"] = true;
-                    af["ias"] = true;
-                    af["tas"] = true;
-                    af["nav_altitude_mcp"] = true;
-                    af["roll"] = true;
-                    af["nav_qnh"] = true;
+                    add_aircraft_filter(filter["aircraft"][0].to<JsonObject>());
+                    add_aircraft_filter(filter["ac"][0].to<JsonObject>());
 
+                    CountingStream body(*http.getStreamPtr());
                     JsonDocument doc;
-                    DeserializationError err = (buf && total > 0)
-                        ? deserializeJson(doc, buf, total, DeserializationOption::Filter(filter))
-                        : DeserializationError::EmptyInput;
-                    if (buf) free(buf);
+                    DeserializationError err =
+                        deserializeJson(doc, body, DeserializationOption::Filter(filter));
+                    _fstats.bytes_received += body.count();
 
                     if (!err) {
                         _fstats.fetch_ok++;
@@ -330,6 +347,7 @@ static void fetch_task(void *param) {
                 } else {
                     _fstats.fetch_fail++;
                     error_log_add("HTTP %d", httpCode);
+                    if (httpCode == 429) backoff_ms = ADSB_BACKOFF_MS;
                 }
                 http.end();
                 http_mutex_release();
@@ -338,7 +356,7 @@ static void fetch_task(void *param) {
             error_log_add("Network down");
             WiFi.reconnect();
         }
-        vTaskDelay(pdMS_TO_TICKS(ADSB_POLL_INTERVAL_MS));
+        vTaskDelay(pdMS_TO_TICKS(ADSB_POLL_INTERVAL_MS + backoff_ms));
     }
 }
 
@@ -382,6 +400,7 @@ static void route_enrich_task(void *param) {
             client.setHandshakeTimeout(8);
             HTTPClient http;
             http.begin(client, url);
+            http.setUserAgent(HTTP_USER_AGENT);
             http.setTimeout(8000);
             int code = http.GET();
 

@@ -1,5 +1,6 @@
 #include "enrichment.h"
 #include "http_mutex.h"
+#include "../config.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -63,6 +64,7 @@ static void fetch_task(void *param) {
         client.setHandshakeTimeout(5);
         HTTPClient http;
         http.begin(client, url);
+        http.setUserAgent(HTTP_USER_AGENT);
         http.setTimeout(5000);
         if (http.GET() == HTTP_CODE_OK) {
             String payload = http.getString();
@@ -89,6 +91,7 @@ static void fetch_task(void *param) {
         client.setHandshakeTimeout(5);
         HTTPClient http;
         http.begin(client, url);
+        http.setUserAgent(HTTP_USER_AGENT);
         http.setTimeout(5000);
         if (http.GET() == HTTP_CODE_OK) {
             String payload = http.getString();
@@ -121,6 +124,7 @@ static void fetch_task(void *param) {
         client.setHandshakeTimeout(5);
         HTTPClient http;
         http.begin(client, url);
+        http.setUserAgent(HTTP_USER_AGENT);
         http.setTimeout(5000);
         if (http.GET() == HTTP_CODE_OK) {
             String payload = http.getString();

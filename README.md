@@ -198,7 +198,10 @@ Available settings:
 
 ## Data Sources
 
-- **Aircraft positions:** [api.adsb.lol](https://api.adsb.lol) (free, no API key)
+- **Aircraft positions:** [adsb.fi open data](https://github.com/adsbfi/opendata) (free, no API key, 250 nm max radius, ~1 request/sec)
+  - Endpoint and radius live in `src/config.h` (`ADSB_API_URL_FMT`, `ADSB_RADIUS_NM`)
+  - Requests send an identifiable `User-Agent` (`HTTP_USER_AGENT`); the default
+    `ESP32HTTPClient` agent is rejected with HTTP 403 by some feeds (api.adsb.lol)
 - **Enrichment data:** [adsbdb.com](https://www.adsbdb.com) (callsign/aircraft lookups)
 
 ## Flash Usage
